@@ -26,6 +26,7 @@
  #include <signal.h>
  #include <inttypes.h>
 
+#include "platform_config.h"
 #include "jshardware.h"
 #include "jsutils.h"
 #include "jsparse.h"
@@ -34,8 +35,16 @@
 #include <pthread.h>
 
 #define FAKE_FLASH_FILENAME  "espruino.flash"
-#define FAKE_FLASH_BLOCKSIZE 4096
-#define FAKE_FLASH_BLOCKS    16
+#define FAKE_FLASH_BLOCKSIZE FLASH_PAGE_SIZE
+#define FAKE_FLASH_BLOCKS    (FLASH_TOTAL/FLASH_PAGE_SIZE)
+
+#ifndef FLASH_64BITS_ALIGNMENT
+#define FLASH_UNITARY_WRITE_SIZE 4
+#else
+#define FLASH_UNITARY_WRITE_SIZE 8
+#endif
+
+
 
 #ifdef USE_WIRINGPI
 // see http://wiringpi.com/download-and-install/
@@ -94,27 +103,32 @@ void sysfs_read(const char *path, char *data, unsigned int len) {
 JsVarInt sysfs_read_int(const char *path) {
   char buf[20];
   sysfs_read(path, buf, sizeof(buf));
-  return stringToIntWithRadix(buf, 10, 0);
+  return stringToIntWithRadix(buf, 10, NULL, NULL);
 }
 #endif
+
 // ----------------------------------------------------------------------------
 #ifdef USE_WIRINGPI
+#if EXTI_COUNT < 16
+#error EXTI_COUNT needs to be 16 or above for WiringPi
+#endif
+
 void irqEXTI0() { jshPushIOWatchEvent(EV_EXTI0); }
-void irqEXTI1() { jshPushIOWatchEvent(EV_EXTI1); }
-void irqEXTI2() { jshPushIOWatchEvent(EV_EXTI2); }
-void irqEXTI3() { jshPushIOWatchEvent(EV_EXTI3); }
-void irqEXTI4() { jshPushIOWatchEvent(EV_EXTI4); }
-void irqEXTI5() { jshPushIOWatchEvent(EV_EXTI5); }
-void irqEXTI6() { jshPushIOWatchEvent(EV_EXTI6); }
-void irqEXTI7() { jshPushIOWatchEvent(EV_EXTI7); }
-void irqEXTI8() { jshPushIOWatchEvent(EV_EXTI8); }
-void irqEXTI9() { jshPushIOWatchEvent(EV_EXTI9); }
-void irqEXTI10() { jshPushIOWatchEvent(EV_EXTI10); }
-void irqEXTI11() { jshPushIOWatchEvent(EV_EXTI11); }
-void irqEXTI12() { jshPushIOWatchEvent(EV_EXTI12); }
-void irqEXTI13() { jshPushIOWatchEvent(EV_EXTI13); }
-void irqEXTI14() { jshPushIOWatchEvent(EV_EXTI14); }
-void irqEXTI15() { jshPushIOWatchEvent(EV_EXTI15); }
+void irqEXTI1() { jshPushIOWatchEvent(EV_EXTI0+1); }
+void irqEXTI2() { jshPushIOWatchEvent(EV_EXTI0+2); }
+void irqEXTI3() { jshPushIOWatchEvent(EV_EXTI0+3); }
+void irqEXTI4() { jshPushIOWatchEvent(EV_EXTI0+4); }
+void irqEXTI5() { jshPushIOWatchEvent(EV_EXTI0+5); }
+void irqEXTI6() { jshPushIOWatchEvent(EV_EXTI0+6); }
+void irqEXTI7() { jshPushIOWatchEvent(EV_EXTI0+7); }
+void irqEXTI8() { jshPushIOWatchEvent(EV_EXTI0+8); }
+void irqEXTI9() { jshPushIOWatchEvent(EV_EXTI0+9); }
+void irqEXTI10() { jshPushIOWatchEvent(EV_EXTI0+10); }
+void irqEXTI11() { jshPushIOWatchEvent(EV_EXTI0+11); }
+void irqEXTI12() { jshPushIOWatchEvent(EV_EXTI0+12); }
+void irqEXTI13() { jshPushIOWatchEvent(EV_EXTI0+13); }
+void irqEXTI14() { jshPushIOWatchEvent(EV_EXTI0+14); }
+void irqEXTI15() { jshPushIOWatchEvent(EV_EXTI0+15); }
 void irqEXTIDoNothing() { }
 
 void (*irqEXTIs[16])(void) = {
@@ -172,6 +186,8 @@ bool jshGetDevicePath(IOEventFlags device, char *buf, size_t bufSize) {
   jsvUnLock2(str, obj);
   return success;
 }
+
+
 
 // ----------------------------------------------------------------------------
 // for non-blocking IO
@@ -244,8 +260,8 @@ void jshInputThread() {
       execInfo.execute = (execInfo.execute & ~EXEC_CTRL_C_WAIT) | EXEC_INTERRUPTED;
     if (execInfo.execute & EXEC_CTRL_C)
       execInfo.execute = (execInfo.execute & ~EXEC_CTRL_C) | EXEC_CTRL_C_WAIT;
-    // Read from the console
-    while (kbhit()) {
+    // Read from the console if we have space
+    while (kbhit() && (jshGetEventsUsed()<IOBUFFERMASK/2)) {
       int ch = getch();
       if (ch<0) break;
       jshPushIOCharEvent(EV_USBSERIAL, (char)ch);
@@ -292,7 +308,7 @@ void jshInputThread() {
       }
 #endif
 
-    usleep(shortSleep ? 1000 : 50000);
+    jshDelayMicroseconds(shortSleep ? 1000 : 50000);
   }
 }
 
@@ -303,7 +319,7 @@ void jshInit() {
 #ifdef USE_WIRINGPI
   if (geteuid() == 0) {
     printf("RUNNING AS SUDO - awesome. You'll get proper IRQ support\n");
-    wiringPiSetup();
+    wiringPiSetupGpio();
   } else {
     printf("NOT RUNNING AS SUDO - sorry, you'll get rubbish realtime IO. You also need to export the pins you want to use first.\n");
     wiringPiSetupSys() ;
@@ -353,7 +369,10 @@ void jshReset() {
 void jshKill() {
   int i;
 
+  // Request that the input thread finishes
   isInitialised = false;
+  // wait for thread to finish
+  pthread_join(inputThread, NULL);
 
   for (i=0;i<=EV_DEVICE_MAX;i++)
     if (ioDevices[i]) {
@@ -386,7 +405,7 @@ int jshGetSerialNumber(unsigned char *data, int maxChars) {
       if (strncmp(line, "Serial", 6) == 0) {
         char serial_string[16 + 1];
         strcpy(serial_string, strchr(line, ':') + 2);
-        serial = stringToIntWithRadix(serial_string, 16, 0);
+        serial = stringToIntWithRadix(serial_string, 16, NULL, NULL);
       }
     }
     fclose(f);
@@ -422,8 +441,16 @@ void jshInterruptOff() {
 void jshInterruptOn() {
 }
 
+/// Are we currently in an interrupt?
+bool jshIsInInterrupt() {
+  return false; // or check if we're in the IO handling thread?
+}
+
 void jshDelayMicroseconds(int microsec) {
-  usleep(microsec);
+  struct timeval tv;
+  tv.tv_sec  = microsec / 1000000;
+  tv.tv_usec = (suseconds_t) microsec % 1000000;
+  select( 0, NULL, NULL, NULL, &tv );
 }
 
 void jshPinSetState(Pin pin, JshPinState state) {
@@ -555,7 +582,7 @@ void jshPinPulse(Pin pin, bool value, JsVarFloat time) {
   if (jshIsPinValid(pin)) {
     jshPinSetState(pin, JSHPINSTATE_GPIO_OUT);
     jshPinSetValue(pin, value);
-    usleep(time*1000000);
+    jshDelayMicroseconds(time*1000000);
     jshPinSetValue(pin, !value);
   } else jsError("Invalid pin!");
 }
@@ -617,6 +644,12 @@ void jshUSARTSetup(IOEventFlags device, JshUSARTInfo *inf) {
   assert(DEVICE_IS_USART(device));
   if (ioDevices[device]) close(ioDevices[device]);
   ioDevices[device] = 0;
+  
+  if (inf->errorHandling) {
+    jsExceptionHere(JSET_ERROR, "Linux Espruino builds can't handle framing/parity errors (errors:true)");
+    return;
+  } 
+  
   char path[256];
   if (jshGetDevicePath(device, path, sizeof(path))) {
     ioDevices[device] = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -773,7 +806,7 @@ bool jshSleep(JsSysTime timeUntilWake) {
   if (usecs > 50000)
     usecs = 50000; // don't want to sleep too much (user input/HTTP/etc)
   if (usecs >= 1000)  
-    usleep(usecs); 
+    jshDelayMicroseconds(usecs);
   return true;
 }
 
@@ -804,9 +837,11 @@ JsVarFloat jshReadVRef()  { return NAN; };
 unsigned int jshGetRandomNumber() { return rand(); }
 
 bool jshFlashGetPage(uint32_t addr, uint32_t *startAddr, uint32_t *pageSize) {
-  if (addr > (FAKE_FLASH_BLOCKSIZE * FAKE_FLASH_BLOCKS))
+  if (addr < FLASH_START)
+    return false;
+  if (addr >= FLASH_START+(FAKE_FLASH_BLOCKSIZE * FAKE_FLASH_BLOCKS))
       return false;
-  *startAddr = (uint32_t) (floor(addr / FAKE_FLASH_BLOCKSIZE) * FAKE_FLASH_BLOCKSIZE);
+  *startAddr = (uint32_t)(floor(addr / FAKE_FLASH_BLOCKSIZE) * FAKE_FLASH_BLOCKSIZE);
   *pageSize = FAKE_FLASH_BLOCKSIZE;
   return true;
 }
@@ -816,14 +851,15 @@ JsVar *jshFlashGetFree() {
   uint32_t pAddr, pSize;
   JsVar *jsArea = jsvNewObject();
   if (!jsArea) return jsFreeFlash;
-  jsvObjectSetChildAndUnLock(jsArea, "addr", jsvNewFromInteger(0));
+  jsvObjectSetChildAndUnLock(jsArea, "addr", jsvNewFromInteger(FLASH_START));
   jsvObjectSetChildAndUnLock(jsArea, "length", jsvNewFromInteger(FAKE_FLASH_BLOCKSIZE*FAKE_FLASH_BLOCKS));
   jsvArrayPushAndUnLock(jsFreeFlash, jsArea);
   return jsFreeFlash;
 }
 
-static FILE *jshFlashOpenFile() {
+static FILE *jshFlashOpenFile(bool dontCreate) {
   FILE *f = fopen(FAKE_FLASH_FILENAME, "r+b");
+  if (!f && dontCreate) return 0;
   if (!f) f = fopen(FAKE_FLASH_FILENAME, "wb");
   if (!f) return 0;
   int len = FAKE_FLASH_BLOCKSIZE*FAKE_FLASH_BLOCKS;
@@ -835,14 +871,18 @@ static FILE *jshFlashOpenFile() {
     memset(buf,0xFF, pad);
     fwrite(buf, 1, pad, f);
     free(buf);
+    fclose(f);
+    f = fopen(FAKE_FLASH_FILENAME, "r+b");
   }
   return f;
 }
 void jshFlashErasePage(uint32_t addr) {
-  FILE *f = jshFlashOpenFile();
-  if (!f) return;
+  jsDebug(DBG_VERBOSE,"FlashErasePage 0x%08x\n", addr);
+  FILE *f = jshFlashOpenFile(true);
+  if (!f) return; // if no file and we're erasing, we don't have to do anything
   uint32_t startAddr, pageSize;
   if (jshFlashGetPage(addr, &startAddr, &pageSize)) {
+    startAddr -= FLASH_START;
     fseek(f, startAddr, SEEK_SET);
     char *buf = malloc(pageSize);
     memset(buf, 0xFF, pageSize);
@@ -852,28 +892,76 @@ void jshFlashErasePage(uint32_t addr) {
   fclose(f);
 }
 void jshFlashRead(void *buf, uint32_t addr, uint32_t len) {
-  FILE *f = jshFlashOpenFile();
-  if (!f) return;
+  jsDebug(DBG_VERBOSE,"FlashRead 0x%08x %d\n", addr,len);
+  //assert(!(addr&(FLASH_UNITARY_WRITE_SIZE-1))); // sanity checks here to mirror real hardware
+  //assert(!(len&(FLASH_UNITARY_WRITE_SIZE-1))); // sanity checks here to mirror real hardware
+  if (addr<FLASH_START || addr>=FLASH_START+FLASH_TOTAL) {
+    assert(0); // out of range
+    return;
+  }
+  addr -= FLASH_START;
+
+  FILE *f = jshFlashOpenFile(true);
+  if (!f) { // no file, so it's all 0xFF
+    memset(buf, 0xFF, len);
+    return;
+  }
   fseek(f, addr, SEEK_SET);
-  fread(buf, 1, len, f);
+  size_t r = fread(buf, 1, len, f);
+  assert(r==len);
   fclose(f);
 }
 void jshFlashWrite(void *buf, uint32_t addr, uint32_t len) {
-  FILE *f = jshFlashOpenFile();
+  jsDebug(DBG_VERBOSE,"FlashWrite 0x%08x %d\n", addr,len);
+  uint32_t i;
+#ifndef SPIFLASH_BASE // for debug
+  assert(!(addr&(FLASH_UNITARY_WRITE_SIZE-1))); // sanity checks here to mirror real hardware
+  assert(!(len&(FLASH_UNITARY_WRITE_SIZE-1))); // sanity checks here to mirror real hardware
+#endif
+
+  /*jsiConsolePrintf("%08x ", addr);
+  for (i=0;i<len;i++)
+    jsiConsolePrintf("%02x ", (int)((unsigned char*)buf)[i]);
+  jsiConsolePrintf("\n");*/
+
+  if (addr<FLASH_START || addr>=FLASH_START+FLASH_TOTAL) {
+    assert(0); // out of range
+    return;
+  }
+  addr -= FLASH_START;
+
+  FILE *f = jshFlashOpenFile(false);
   if (!f) return;
 
   char *wbuf = malloc(len);
-  fseek(f, addr, SEEK_SET);
-  fread(wbuf, 1, len, f);
-  uint32_t i;
-  for (i=0;i<len;i++)
+  int err = fseek(f, addr, SEEK_SET);
+  assert(err==0);
+  size_t r = fread(wbuf, 1, len, f);
+  assert(r==len);
+
+  for (i=0;i<len;i++) {
+    //jsiConsolePrintf("Write %d to 0x%08x\n", ((char*)buf)[i], FLASH_START+addr+i);
     wbuf[i] &= ((char*)buf)[i];
+  }
   fseek(f, addr, SEEK_SET);
   fwrite(wbuf, 1, len, f);
   free(wbuf);
+  //fsync(f);
   fclose(f);
+}
+
+// No - we can't memory-map the flash memory under Linux (well, we could but for testing it's handy not to)
+size_t jshFlashGetMemMapAddress(size_t ptr) {
+  return 0;
 }
 
 unsigned int jshSetSystemClock(JsVar *options) {
   return 0;
+}
+
+/// Perform a proper hard-reboot of the device
+void jshReboot() {
+  jsiConsolePrintf("Not implemented\n");
+  exit(1);
+
 }

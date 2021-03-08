@@ -17,6 +17,7 @@ import pinutils;
 info = {
  'name' : "Raspberry Pi",
  'default_console' : "EV_USBSERIAL",
+ 'variables' :  0, # 0 = resizable variables, rather than fixed
  'binary_name' : 'espruino_%v_raspberrypi',
  'build' : {
    'optimizeflags' : '-O3',
@@ -24,10 +25,10 @@ info = {
      'NET',
      'GRAPHICS',
      'FILESYSTEM',
-     'CRYPTO',
+     'CRYPTO','SHA256','SHA512',
      'TLS',
-     'HASHLIB',
      'TELNET',
+     'TENSORFLOW',
    ],
    'makefile' : [
      'LINUX=1',
@@ -39,8 +40,8 @@ chip = {
   'part' : "RASPBERRYPI",
   'family' : "LINUX",
   'package' : "",
-  'ram' : -1,
-  'flash' : -1,
+  'ram' : 0,
+  'flash' : 256, # size of file used to fake flash memory (kb)
   'speed' : -1,
   'usart' : 1,
   'spi' : 1,
@@ -50,7 +51,8 @@ chip = {
 };
 
 devices = {
-  'LED1' : { 'pin' : 'D16' }
+  'LED1' : { 'pin' : 'D16' },
+  'USB' : {} # to convince code that we have a USB port (it's used for the console in Linux)
 };
 
 def get_pins():

@@ -56,14 +56,15 @@ The third SPI port
   "type" : "constructor",
   "class" : "SPI",
   "name" : "SPI",
-  "generate" : "jswrap_spi_constructor"
+  "generate" : "jswrap_spi_constructor",
+  "return" : ["JsVar","A SPI object"]
 }
 Create a software SPI port. This has limited functionality (no baud rate), but it can work on any pins.
 
 Use `SPI.setup` to configure this port.
  */
 JsVar *jswrap_spi_constructor() {
-  return jsvNewObject();
+  return jspNewObject(0,"SPI");
 }
 
 /*JSON{
@@ -87,11 +88,33 @@ May return undefined if no device can be found.
   "name" : "setup",
   "generate" : "jswrap_spi_setup",
   "params" : [
-    ["options","JsVar",["An optional structure containing extra information on initialising the SPI port","Please note that baud rate is set to the nearest that can be managed - which may be -+ 50%","```{sck:pin, miso:pin, mosi:pin, baud:integer=100000, mode:integer=0, order:'msb'/'lsb'='msb' }```","If sck,miso and mosi are left out, they will automatically be chosen. However if one or more is specified then the unspecified pins will not be set up.","You can find out which pins to use by looking at [your board's reference page](#boards) and searching for pins with the `SPI` marker.","The SPI ```mode``` is between 0 and 3 - see http://en.wikipedia.org/wiki/Serial_Peripheral_Interface_Bus#Clock_polarity_and_phase","On STM32F1-based parts, you cannot mix AF and non-AF pins (SPI pins are usually grouped on the chip - and you can't mix pins from two groups). Espruino will not warn you about this."]]
+    ["options","JsVar","An Object containing extra information on initialising the SPI port"]
   ]
 }
 Set up this SPI port as an SPI Master.
- */
+
+Options can contain the following (defaults are shown where relevant):
+
+```
+{
+  sck:pin, 
+  miso:pin, 
+  mosi:pin, 
+  baud:integer=100000, // ignored on software SPI
+  mode:integer=0, // between 0 and 3
+  order:string='msb' // can be 'msb' or 'lsb' 
+  bits:8 // only available for software SPI
+}
+```
+
+If `sck`,`miso` and `mosi` are left out, they will automatically be chosen. However if one or more is specified then the unspecified pins will not be set up.
+
+You can find out which pins to use by looking at [your board's reference page](#boards) and searching for pins with the `SPI` marker. Some boards such as those based on `nRF52` chips can have SPI on any pins, so don't have specific markings.
+
+The SPI `mode` is between 0 and 3 - see http://en.wikipedia.org/wiki/Serial_Peripheral_Interface_Bus#Clock_polarity_and_phase
+
+On STM32F1-based parts, you cannot mix AF and non-AF pins (SPI pins are usually grouped on the chip - and you can't mix pins from two groups). Espruino will not warn you about this.
+*/
 void jswrap_spi_setup(
     JsVar *parent, //!< The variable that is the class instance of this function.
     JsVar *options //!< The options controlling SPI.
@@ -106,9 +129,6 @@ void jswrap_spi_setup(
   //
   IOEventFlags device = jsiGetDeviceFromClass(parent);
   JshSPIInfo inf;
-
-  // Debug
-  // jsiConsolePrintf("jswrap_spi_setup called parent=%v, options=%v\n", parent, options);
 
   if (!jsspiPopulateSPIInfo(&inf, options)) return;
 
@@ -167,16 +187,17 @@ typedef struct {
  * Send a single byte to the SPI device, used as callback.
  */
 void jswrap_spi_send_cb(
-    int c,                     //!< The byte to send through SPI.
-    jswrap_spi_send_data *data //!< Control information on how to send to SPI.
+    unsigned char *data, unsigned int len,
+    jswrap_spi_send_data *callbackData
   ) {
-  // Invoke the SPI send function to transmit the single byte.
-  int result = data->spiSend(c, &data->spiSendData);
-  if (c>=0) data->txAmt++;
-  if (result>=0) {
-    jsvArrayBufferIteratorSetByteValue(&data->it, (char)result);
-    jsvArrayBufferIteratorNext(&data->it);
-    data->rxAmt++;
+  unsigned char *rx = alloca(len);
+  // TODO: alloc check?
+  callbackData->spiSend(data, rx, len, &callbackData->spiSendData);
+  callbackData->txAmt += len;
+  callbackData->rxAmt += len;
+  while (len--) {
+    jsvArrayBufferIteratorSetByteValue(&callbackData->it, *(rx++));
+    jsvArrayBufferIteratorNext(&callbackData->it);
   }
 }
 
@@ -215,36 +236,29 @@ JsVar *jswrap_spi_send(
 
   // Handle the data being a single byte value
   if (jsvIsNumeric(srcdata)) {
-    int d = jsvGetInteger(srcdata);
-    if (d<0) d = 0; // protect against -1 as we use this in the jshardware SPI implementation
-    int r = data.spiSend(d, &data.spiSendData);
-    if (r<0) r = data.spiSend(-1, &data.spiSendData);
-    dst = jsvNewFromInteger(r); // retrieve the byte (no send!)
+    unsigned char ch = (unsigned char)jsvGetInteger(srcdata);
+    data.spiSend(&ch, &ch, 1, &data.spiSendData);
+    dst = jsvNewFromInteger(ch);
   }
   // Handle the data being a string
   else if (jsvIsString(srcdata)) {
     dst = jsvNewFromEmptyString();
+    unsigned char outdata[128];
     JsvStringIterator it;
     jsvStringIteratorNew(&it, srcdata, 0);
-    int incount = 0, outcount = 0;
     while (jsvStringIteratorHasChar(&it) && !jspIsInterrupted()) {
-      unsigned char in = (unsigned char)jsvStringIteratorGetChar(&it);
-      incount++;
-      int out = data.spiSend(in, &data.spiSendData);
-      if (out>=0) {
-        outcount++;
-        char outc = (char)out;
-        jsvAppendStringBuf(dst, (char*)&outc, 1);
+      unsigned char *indata;
+      unsigned int len;
+      jsvStringIteratorGetPtrAndNext(&it,&indata,&len);
+      while (len) {
+        unsigned int l = (len>sizeof(outdata))?sizeof(outdata):len;
+        data.spiSend(indata, outdata, l, &data.spiSendData);
+        jsvAppendStringBuf(dst, (char*)outdata, l);
+        len-=l;
+        indata+=l;
       }
-      jsvStringIteratorNext(&it);
     }
     jsvStringIteratorFree(&it);
-    // finally add the remaining bytes  (no send!)
-    while (outcount < incount && !jspIsInterrupted()) {
-      outcount++;
-      unsigned char out = (unsigned char)data.spiSend(-1, &data.spiSendData);
-      jsvAppendStringBuf(dst, (char*)&out, 1);
-    }
   } else {
     // Handle the data being an iterable.
     int nBytes = jsvIterateCallbackCount(srcdata);
@@ -252,11 +266,7 @@ JsVar *jswrap_spi_send(
     if (dst) {
       data.rxAmt = data.txAmt = 0;
       jsvArrayBufferIteratorNew(&data.it, dst, 0);
-      // Write data
-      jsvIterateCallback(srcdata, (void (*)(int,  void *))jswrap_spi_send_cb, &data);
-      // Wait until SPI send is finished, and flush data
-      while (data.rxAmt < data.txAmt && !jspIsInterrupted())
-        jswrap_spi_send_cb(-1, &data);
+      jsvIterateBufferCallback(srcdata, (jsvIterateBufferCallbackFn)jswrap_spi_send_cb, &data);
       jsvArrayBufferIteratorFree(&data.it);
     }
   }
@@ -267,13 +277,25 @@ JsVar *jswrap_spi_send(
 }
 
 
+typedef struct {
+  spi_sender spiSend;          //!< A function to be called to send SPI data.
+  spi_sender_data spiSendData; //!< Control information on the nature of the SPI interface.
+} jswrap_spi_write_data;
+
+void jswrap_spi_write_cb(
+    unsigned char *data, unsigned int len,
+    jswrap_spi_write_data *callbackData
+  ) {
+  callbackData->spiSend(data, NULL, len, &callbackData->spiSendData);
+}
+
 /*JSON{
   "type" : "method",
   "class" : "SPI",
   "name" : "write",
   "generate" : "jswrap_spi_write",
   "params" : [
-    ["data","JsVarArray",["One or more items to write. May be ints, strings, arrays, or objects of the form `{data: ..., count:#}`.","If the last argument is a pin, it is taken to be the NSS pin"]]
+    ["data","JsVarArray",["One or more items to write. May be ints, strings, arrays, or special objects (see `E.toUint8Array` for more info).","If the last argument is a pin, it is taken to be the NSS pin"]]
   ]
 }
 Write a character or array of characters to SPI - without reading the result back.
@@ -291,6 +313,10 @@ void jswrap_spi_write(
   spi_sender_data spiSendData;
   if (!jsspiGetSendFunction(parent, &spiSend, &spiSendData))
     return;
+
+  jswrap_spi_write_data spi_write_data;
+  spi_write_data.spiSend = spiSend;
+  spi_write_data.spiSendData = spiSendData;
 
   Pin nss_pin = PIN_UNDEFINED;
   // If the last value is a pin, use it as the NSS pin
@@ -310,7 +336,7 @@ void jswrap_spi_write(
   // assert NSS
   if (nss_pin!=PIN_UNDEFINED) jshPinOutput(nss_pin, false);
   // Write data
-  jsvIterateCallback(args, (void (*)(int,  void *))spiSend, &spiSendData);
+  jsvIterateBufferCallback(args, (jsvIterateBufferCallbackFn)jswrap_spi_write_cb, &spi_write_data);
   // Wait until SPI send is finished, and flush data
   if (DEVICE_IS_SPI(device))
     jshSPIWait(device);
@@ -368,7 +394,7 @@ void jswrap_spi_send4bit(JsVar *parent, JsVar *srcdata, int bit0, int bit1, Pin 
   } else if (jsvIsIterable(srcdata)) {
     jshInterruptOff();
     JsvIterator it;
-    jsvIteratorNew(&it, srcdata);
+    jsvIteratorNew(&it, srcdata, JSIF_EVERY_ARRAY_ELEMENT);
     while (jsvIteratorHasElement(&it)) {
       unsigned char in = (unsigned char)jsvIteratorGetIntegerValue(&it);
       jsspiSend4bit(device, in, bit0, bit1);
@@ -437,7 +463,7 @@ void jswrap_spi_send8bit(JsVar *parent, JsVar *srcdata, int bit0, int bit1, Pin 
   } else if (jsvIsIterable(srcdata)) {
     jshInterruptOff();
     JsvIterator it;
-    jsvIteratorNew(&it, srcdata);
+    jsvIteratorNew(&it, srcdata, JSIF_EVERY_ARRAY_ELEMENT);
     while (jsvIteratorHasElement(&it)) {
       unsigned char in = (unsigned char)jsvIteratorGetIntegerValue(&it);
       jsspiSend8bit(device, in, bit0, bit1);
@@ -468,14 +494,15 @@ All addresses are in 7 bit format. If you have an 8 bit address then you need to
   "type" : "constructor",
   "class" : "I2C",
   "name" : "I2C",
-  "generate" : "jswrap_i2c_constructor"
+  "generate" : "jswrap_i2c_constructor",
+  "return" : ["JsVar","An I2C object"]
 }
 Create a software I2C port. This has limited functionality (no baud rate), but it can work on any pins.
 
-Use `SPI.setup` to configure this port.
+Use `I2C.setup` to configure this port.
  */
 JsVar *jswrap_i2c_constructor() {
-  return jsvNewObject();
+  return jspNewObject(0,"I2C");
 }
 
 /*JSON{
@@ -526,7 +553,7 @@ The third I2C port
   "name" : "setup",
   "generate" : "jswrap_i2c_setup",
   "params" : [
-    ["options","JsVar",["An optional structure containing extra information on initialising the I2C port","```{scl:pin, sda:pin, bitrate:100000}```","You can find out which pins to use by looking at [your board's reference page](#boards) and searching for pins with the `I2C` marker. Note that 400000kHz is the maximum bitrate for most parts."]]
+    ["options","JsVar",["An optional structure containing extra information on initialising the I2C port","```{scl:pin, sda:pin, bitrate:100000}```","You can find out which pins to use by looking at [your board's reference page](#boards) and searching for pins with the `I2C` marker. Note that 400kHz is the maximum bitrate for most parts."]]
   ]
 }
 Set up this I2C port
@@ -538,8 +565,18 @@ void jswrap_i2c_setup(JsVar *parent, JsVar *options) {
   JshI2CInfo inf;
   if (jsi2cPopulateI2CInfo(&inf, options)) {
     if (DEVICE_IS_I2C(device)) {
+#ifdef I2C_SLAVE
+      if (inf.slaveAddr>=0) {
+        jsvObjectSetChildAndUnLock(parent, "buffer", jsvNewTypedArray(ARRAYBUFFERVIEW_UINT8, 64));
+      }
+#endif
       jshI2CSetup(device, &inf);
     } else if (device == EV_NONE) {
+#ifdef I2C_SLAVE
+      if (inf.slaveAddr>=0) {
+        jsExceptionHere(JSET_ERROR, "I2C Slave not implemented on software I2C");
+      }
+#endif
 #ifndef SAVE_ON_FLASH
       // software mode - at least configure pins properly
       if (inf.pinSCL != PIN_UNDEFINED) {
@@ -579,7 +616,7 @@ static NO_INLINE int i2c_get_address(JsVar *address, bool *sendStop) {
   "generate" : "jswrap_i2c_writeTo",
   "params" : [
     ["address","JsVar","The 7 bit address of the device to transmit to, or an object of the form `{address:12, stop:false}` to send this data without a STOP signal."],
-    ["data","JsVarArray","One or more items to write. May be ints, strings, arrays, or objects of the form `{data: ..., count:#}`."]
+    ["data","JsVarArray","One or more items to write. May be ints, strings, arrays, or special objects (see `E.toUint8Array` for more info)."]
   ]
 }
 Transmit to the slave device with the given address. This is like Arduino's beginTransmission, write, and endTransmission rolled up into one.

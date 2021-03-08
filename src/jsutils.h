@@ -26,9 +26,9 @@
 #include <math.h>
 
 #ifndef BUILDNUMBER
-#define JS_VERSION "1v92"
+#define JS_VERSION "2v08"
 #else
-#define JS_VERSION "1v92." BUILDNUMBER
+#define JS_VERSION "2v08." BUILDNUMBER
 #endif
 /*
   In code:
@@ -39,6 +39,10 @@
 
 #ifndef alloca
 #define alloca(x) __builtin_alloca(x)
+#endif
+
+#ifdef SAVE_ON_FLASH
+#define SAVE_ON_FLASH_MATH 1
 #endif
 
 #if defined(ESP8266)
@@ -99,6 +103,16 @@ int flash_strcmp(const char *mem, const char *flash);
 
 #endif
 
+#ifdef FLASH_64BITS_ALIGNMENT
+typedef uint64_t JsfWord;
+#define JSF_ALIGNMENT 8
+#define JSF_WORD_UNSET 0xFFFFFFFFFFFFFFFFULL
+#else
+typedef uint32_t JsfWord;
+#define JSF_ALIGNMENT 4
+#define JSF_WORD_UNSET 0xFFFFFFFF
+#endif
+
 
 #if defined(ESP8266)
 /** For the esp8266 we need to add CALLED_FROM_INTERRUPT to all functions that may execute at
@@ -106,7 +120,12 @@ int flash_strcmp(const char *mem, const char *flash);
     it as a no-op for everyone else. This is identical the ICACHE_RAM_ATTR used elsewhere. */
 #define CALLED_FROM_INTERRUPT __attribute__((section(".iram1.text")))
 #else
+#if defined(ESP32)
+#include "esp_attr.h"
+#define CALLED_FROM_INTERRUPT IRAM_ATTR
+#else
 #define CALLED_FROM_INTERRUPT
+#endif
 #endif
 
 
@@ -218,11 +237,16 @@ typedef int64_t JsSysTime;
 #define JSLEX_MAX_TOKEN_LENGTH  64 ///< Maximum length we allow tokens (eg. variable names) to be
 #define JS_ERROR_TOKEN_BUF_SIZE 16 ///< see jslTokenAsString
 
-#define JS_NUMBER_BUFFER_SIZE 66 ///< 64 bit base 2 + minus + terminating 0
+#define JS_NUMBER_BUFFER_SIZE 70 ///< Enough for 64 bit base 2 + minus + terminating 0
 
-#define JS_VARS_BEFORE_IDLE_GC 32 ///< If we have less free variables than this, do a garbage collect on Idle
-
-#define JSPARSE_MAX_SCOPES  8
+/* If we have less free variables than this, do a garbage collect on Idle.
+ * Note that the check for free variables takes an amount of time proportional
+ * to the size of JS_VARS_BEFORE_IDLE_GC */
+#ifdef JSVAR_CACHE_SIZE
+#define JS_VARS_BEFORE_IDLE_GC (JSVAR_CACHE_SIZE/20)
+#else
+#define JS_VARS_BEFORE_IDLE_GC 32
+#endif
 
 #define STRINGIFY_HELPER(x) #x
 #define STRINGIFY(x) STRINGIFY_HELPER(x)
@@ -242,6 +266,8 @@ typedef int64_t JsSysTime;
 #define JSPARSE_FUNCTION_NAME_NAME JS_HIDDEN_CHAR_STR"nam" // for named functions (a = function foo() { foo(); })
 #define JSPARSE_FUNCTION_LINENUMBER_NAME JS_HIDDEN_CHAR_STR"lin" // The line number offset of the function
 #define JS_EVENT_PREFIX "#on"
+#define JS_TIMEZONE_VAR "tz"
+#define JS_GRAPHICS_VAR "gfx"
 
 #define JSPARSE_EXCEPTION_VAR "except" // when exceptions are thrown, they're stored in the root scope
 #define JSPARSE_STACKTRACE_VAR "sTrace" // for errors/exceptions, a stack trace is stored as a string
@@ -326,7 +352,7 @@ typedef int64_t JsSysTime;
 #define NIBBLEFIELD_CLEAR(BITFIELD) memset(BITFIELD, 0, sizeof(BITFIELD)) ///< Clear all elements
 */
 
-#if defined(NRF51)
+#if defined(NRF51_SERIES)
   // Cortex-M0 does not support unaligned reads
   #define UNALIGNED_UINT16(addr) ((((uint16_t)*((uint8_t*)(addr)+1)) << 8) | (*(uint8_t*)(addr)))
 #else
@@ -342,14 +368,21 @@ bool isAlpha(char ch);
 bool isIDString(const char *s);
 
 /** escape a character - if it is required. This may return a reference to a static array,
-so you can't store the value it returns in a variable and call it again. */
-const char *escapeCharacter(char ch);
+so you can't store the value it returns in a variable and call it again.
+If jsonStyle=true, only string escapes supported by JSON are used */
+const char *escapeCharacter(char ch, bool jsonStyle);
 /** Parse radix prefixes, or return 0 */
-int getRadix(const char **s, int forceRadix, bool *hasError);
+int getRadix(const char **s,  bool *hasError);
 /// Convert a character to the hexadecimal equivalent (or -1)
 int chtod(char ch);
-/* convert a number in the given radix to an int. if radix=0, autodetect */
-long long stringToIntWithRadix(const char *s, int radix, bool *hasError);
+/// Convert 2 characters to the hexadecimal equivalent (or -1)
+int hexToByte(char hi, char lo);
+/* convert a number in the given radix to an int */
+long long stringToIntWithRadix(const char *s,
+               int forceRadix, //!< if radix=0, autodetect
+               bool *hasError, //!< If nonzero, set to whether there was an error or not
+               const char **endOfInteger //!<  If nonzero, this is set to the point at which the integer finished in the string
+               );
 /* convert hex, binary, octal or decimal string into an int */
 long long stringToInt(const char *s);
 
@@ -366,6 +399,22 @@ typedef enum {
 } JsExceptionType;
 
 void jsAssertFail(const char *file, int line, const char *expr);
+
+#define DBG_INFO 0
+#define DBG_VERBOSE 1
+
+/*
+#if defined(DEBUG) || __FILE__ == DEBUG_FILE
+   #define jsDebug(dbg_type, format, ...) jsiConsolePrintf("[" __FILE__ "]:" format, ## __VA_ARGS__) 
+ #else 
+   #define jsDebug(dbg_type, format, ...) do { } while(0) 
+ #endif
+ */
+#if (defined DEBUG ) ||  ( defined __FILE__ == DEBUG_FILE)
+  #define jsDebug(dbg_type, format, ...) jsiConsolePrintf("[" __FILE__ "]:" format, ## __VA_ARGS__) 
+#else 
+  #define jsDebug(dbg_type, format, ...) do { } while(0) 
+#endif
 
 #ifndef USE_FLASH_MEMORY
 // Normal functions thet place format string in ram
@@ -403,13 +452,23 @@ typedef enum {
   JSERR_LOW_MEMORY = 8, ///< Memory is running low - Espruino had to run a garbage collection pass or remove some of the command history
   JSERR_MEMORY = 16, ///< Espruino ran out of memory and was unable to allocate some data that it needed.
   JSERR_MEMORY_BUSY = 32, ///< Espruino was busy doing something with memory (eg. garbage collection) so an IRQ couldn't allocate memory
+  JSERR_UART_OVERFLOW = 64, ///< A UART received data but it was not read in time and was lost
+
+  JSERR_WARNINGS_MASK = JSERR_LOW_MEMORY ///< Issues that are warnings, not actual problems
 } PACKED_FLAGS JsErrorFlags;
 
 /** Error flags for things that we don't really want to report on the console,
  * but which are good to know about */
-extern JsErrorFlags jsErrorFlags;
+extern volatile JsErrorFlags jsErrorFlags;
 
-JsVarFloat stringToFloatWithRadix(const char *s, int forceRadix);
+/** Convert a string to a JS float variable where the string is of a specific radix. */
+JsVarFloat stringToFloatWithRadix(
+    const char *s, //!< The string to be converted to a float
+    int forceRadix, //!< The radix of the string data, or 0 to guess
+    const char **endOfFloat //!< If nonzero, this is set to the point at which the float finished in the string
+  );
+
+/** convert a string to a floating point JS variable. */
 JsVarFloat stringToFloat(const char *str);
 
 void itostr_extra(JsVarInt vals,char *str,bool signedVal,unsigned int base); // like itoa, but uses JsVarInt (good on non-32 bit systems)
@@ -429,21 +488,24 @@ JsVarFloat wrapAround(JsVarFloat val, JsVarFloat size);
 
 
 typedef void (*vcbprintf_callback)(const char *str, void *user_data);
-/** Espruino-special printf with a callback
- * Supported are:
- *   %d = int
- *   %0#d = int padded to length # with 0s
- *   %x = int as hex
- *   %L = JsVarInt
- *   %Lx = JsVarInt as hex
- *   %f = JsVarFloat
- *   %s = string (char *)
- *   %c = char
- *   %v = JsVar * (doesn't have to be a string - it'll be converted)
- *   %q = JsVar * (in quotes, and escaped)
- *   %j = Variable printed as JSON
- *   %t = Type of variable
- *   %p = Pin
+/**
+ * Espruino-special printf with a callback.
+ *
+ * The supported format specifiers are:
+ * * `%d` = int
+ * * `%0#d` or `%0#x` = int padded to length # with 0s
+ * * `%x` = int as hex
+ * * `%L` = JsVarInt
+ * * `%Lx`= JsVarInt as hex
+ * * `%f` = JsVarFloat
+ * * `%s` = string (char *)
+ * * `%c` = char
+ * * `%v` = JsVar * (doesn't have to be a string - it'll be converted)
+ * * `%q` = JsVar * (in quotes, and escaped)
+ * * `%Q` = JsVar * (in quotes, and escaped the JSON subset of escape chars)
+ * * `%j` = Variable printed as JSON
+ * * `%t` = Type of variable
+ * * `%p` = Pin
  *
  * Anything else will assert
  */
@@ -451,6 +513,9 @@ void vcbprintf(vcbprintf_callback user_callback, void *user_data, const char *fm
 
 /// This one is directly usable..
 void cbprintf(vcbprintf_callback user_callback, void *user_data, const char *fmt, ...);
+
+/// a snprintf replacement so mbedtls doesn't try and pull in the whole stdlib to cat two strings together
+int espruino_snprintf_va( char * s, size_t n, const char * fmt, va_list argp );
 
 /// a snprintf replacement so mbedtls doesn't try and pull in the whole stdlib to cat two strings together
 int espruino_snprintf( char * s, size_t n, const char * fmt, ... );
@@ -464,5 +529,9 @@ void srand(unsigned int seed);
 
 /** get the amount of free stack we have, in bytes */
 size_t jsuGetFreeStack();
+
+#ifdef ESP32
+  void *espruino_stackHighPtr;  //Used by jsuGetFreeStack
+#endif
 
 #endif /* JSUTILS_H_ */

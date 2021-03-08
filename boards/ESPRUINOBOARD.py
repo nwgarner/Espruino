@@ -16,7 +16,7 @@
 import pinutils;
 info = {
  'name' : "Original Espruino Board rev 1.3/1.4",
- 'link' : [ "http://www.espruino.com/EspruinoBoard" ],
+ 'link' : [ "http://www.espruino.com/Original" ],
  'espruino_page_link' : "EspruinoBoard",
  'default_console' : "EV_SERIAL1",
  'default_console_tx' : "A9",
@@ -26,20 +26,23 @@ info = {
  'serial_bootloader' : True,
  'binary_name' : 'espruino_%v_espruino_1r3.bin',
  'binaries' : [
-  { 'filename' : 'espruino_%v_espruino_1r3_wiznet.bin', 'description' : "WIZNet W5500 Ethernet Networking"},
-  { 'filename' : 'espruino_%v_espruino_1r3.bin', 'description' : "TI CC3000 WiFi Networking"},
+  { 'filename' : 'espruino_%v_espruino_1r3.bin', 'description' : "No networking, includes all other features"},
+  { 'filename' : 'espruino_%v_espruino_1r3_at.bin', 'description' : "AT Command WiFi (No vector font, FFT)"},
+  { 'filename' : 'espruino_%v_espruino_1r3_wiznet.bin', 'description' : "WIZNet W5500 Ethernet Networking (No crypto lib, AT Command WiFi, vector font, FFT, debugger or tab complete)"}
  ],
  'build' : {
    'optimizeflags' : '-Os',
    'libraries' : [
-     'NET',
+     #'NET', # enabled by create_zip on demand
      'GRAPHICS',
-     'NEOPIXEL'
-     'HASHLIB'
+     'NEOPIXEL',
+     'CRYPTO','SHA1_JS',
+#     'TV', # TV had to be removed because of flash usage
      'FILESYSTEM'
    ],
    'makefile' : [
      'DEFINES+=-DESPRUINO_1V3',
+     'DEFINES+=-DSAVE_ON_FLASH_MATH', 
      'STLIB=STM32F10X_XL',
      'PRECOMPILED_OBJS+=$(ROOT)/targetlibs/stm32f1/lib/startup_stm32f10x_hd.o'
    ]
@@ -61,17 +64,8 @@ chip = {
     'address' : 0x08000000 + ((256-20)*1024),
     'page_size' : 2048, # size of pages
     'pages' : 10, # number of pages we're using
-    'flash_available' : 256-(20+10) # 20 used for code, 10 for bootloader
-  },
- 'build' : {
-   'defines' : [
-     'USE_NET',
-     'USE_GRAPHICS',
-     'USE_TV',
-     'USE_HASHLIB',
-     'USE_FILESYSTEM'
-   ]
- }
+    'flash_available' : 256-(20+10) # 20k used for code, 10k for bootloader
+  }
 };
 devices = {
   'OSC' : { 'pin_in' :  'D0',

@@ -16,14 +16,13 @@
 import pinutils;
 
 info = {
- 'name' : "PuckJS",
+ 'name' : "Puck.js",
  'link' :  [ "http://www.espruino.com/PuckJS" ],
  'default_console' : "EV_SERIAL1",
  'default_console_tx' : "D28",
  'default_console_rx' : "D29",
  'default_console_baudrate' : "9600",
- # Number of variables can be WAY higher on this board
- 'variables' : 2000, # How many variables are allocated for Espruino to use. RAM will be overflowed if this number is too high and code won't compile.
+ 'variables' : 2250, # How many variables are allocated for Espruino to use. RAM will be overflowed if this number is too high and code won't compile.
  'bootloader' : 1,
  'binary_name' : 'espruino_%v_puckjs.hex',
  'build' : {
@@ -32,16 +31,24 @@ info = {
      'BLUETOOTH',
      'NET',
      'GRAPHICS',
-     'CRYPTO',
+     'CRYPTO','SHA256','SHA512',
+     'AES',
      'NFC',
-     'NEOPIXEL'
-     #'HASHLIB'
+     'NEOPIXEL',
      #'FILESYSTEM'
      #'TLS'
    ],
    'makefile' : [
+     'DEFINES+=-DHAL_NFC_ENGINEERING_BC_FTPAN_WORKAROUND=1', # Looks like proper production nRF52s had this issue
+     # 'DEFINES+=-DCONFIG_GPIO_AS_PINRESET', # reset isn't being used, so let's just have an extra IO (needed for Puck.js V2)
+     'DEFINES+=-DESPR_DCDC_ENABLE', # Ensure DCDC converter is enabled
+     'DEFINES+=-DBLUETOOTH_NAME_PREFIX=\'"Puck.js"\'',
+     'DEFINES+=-DCUSTOM_GETBATTERY=jswrap_puck_getBattery',
+     'DEFINES+=-DNFC_DEFAULT_URL=\'"https://puck-js.com/go"\'',
      'DFU_PRIVATE_KEY=targets/nrf5x_dfu/dfu_private_key.pem',
-     'DFU_SETTINGS=--application-version 0xff --hw-version 52 --sd-req 0x8C'
+     'DFU_SETTINGS=--application-version 0xff --hw-version 52 --sd-req 0x8C',
+     'INCLUDE += -I$(ROOT)/libs/puckjs',
+     'WRAPPERSOURCES += libs/puckjs/jswrap_puck.c'
    ]
  }
 };
@@ -54,15 +61,15 @@ chip = {
   'flash' : 512,
   'speed' : 64,
   'usart' : 1,
-  'spi' : 3,
-  'i2c' : 2,
+  'spi' : 1,
+  'i2c' : 1,
   'adc' : 1,
   'dac' : 0,
   'saved_code' : {
-    'address' : ((118 - 3) * 4096), # Bootloader takes pages 120-127, FS takes 118-119
+    'address' : ((118 - 10) * 4096), # Bootloader takes pages 120-127, FS takes 118-119
     'page_size' : 4096,
-    'pages' : 3,
-    'flash_available' : 512 - ((31 + 8 + 1 + 3)*4) # Softdevice uses 31 pages of flash, bootloader 8, FS 1, code 3. Each page is 4 kb.
+    'pages' : 10,
+    'flash_available' : 512 - ((31 + 8 + 2 + 10)*4) # Softdevice uses 31 pages of flash, bootloader 8, FS 2, code 10. Each page is 4 kb.
   },
 };
 
@@ -70,15 +77,36 @@ devices = {
   'LED1' : { 'pin' : 'D5' },
   'LED2' : { 'pin' : 'D4' },
   'LED3' : { 'pin' : 'D3' },
-  'IR'   : { 'pin_anode' : 'D25', 'pin_cathode' : 'D26' },
+  'IR'   : { 'pin_anode' : 'D25',   # on v2 this just goes to a FET
+             'pin_cathode' : 'D26'  # on v2 this is the powered output named 'FET'
+           },
   'BTN1' : { 'pin' : 'D0', 'pinstate' : 'IN_PULLDOWN' },
   'CAPSENSE' : { 'pin_rx' : 'D11', 'pin_tx' : 'D12' },
   'NFC': { 'pin_a':'D9', 'pin_b':'D10' },
-  'MAG': { 'pin_pwr':'D18',
+  #'MAG': { 'device': 'MAG3110', 'addr' : 0x0E, # v1.0
+  #         'pin_pwr':'D18',
+  #         'pin_int':'D17',
+  #         'pin_sda':'D20',
+  #         'pin_scl':'D19' }
+  # V2.0
+  'MAG': { 'device': 'LIS3MDL', 'addr' : 30, # v2.0
+           'pin_pwr':'D18',
            'pin_int':'D17',
            'pin_sda':'D20',
-           'pin_scl':'D19' }
+           'pin_scl':'D19',
+           'pin_drdy':'D21',
+           },
+  'ACCEL': { 'device': 'LSM6DS3TR', 'addr' : 106, # v2.0
+#           'pin_pwr':'D16', # can't actually power this from an IO pin due to undocumented, massive power draw on startup
+           'pin_int':'D13',
+           'pin_sda':'D14',
+           'pin_scl':'D15' },
+  'TEMP': { 'device': 'PCT2075TP', 'addr' : 78, # v2.0
+           'pin_pwr':'D8',
+           'pin_sda':'D7',
+           'pin_scl':'D6' }
 
+  # Pin D22 is used for clock when driving neopixels - as not specifying a pin seems to break things
 };
 
 # left-right, or top-bottom order
@@ -89,7 +117,8 @@ board = {
   'right2' : [ 'D15' ],
   '_notes' : {
     'D11' : "Capacitive sense. D12 is connected to this pin via a 1 MOhm resistor",
-    'D29' : "If pulled up to 1 on startup, D28 and D29 become Serial1",
+    'D28' : "If pulled up to 1 on startup, D28 and D29 become Serial1",
+    'D22' : "This is used as SCK when driving Neopixels with 'require('neopixel').write'"
   }
 };
 

@@ -17,6 +17,7 @@
 
 #include "jsutils.h"
 #include "jsvar.h"
+#include "jsdevices.h"
 
 /** This is the enum used to store how functions should be called
  * by jsnative.c.
@@ -35,14 +36,14 @@
  *   => bool(JsVar *parent);
  */
 typedef enum {
-  JSWAT_FINISH = 0, // no argument
-  JSWAT_VOID = 0, // Only for return values
-  JSWAT_JSVAR, // standard variable
-  JSWAT_ARGUMENT_ARRAY, // a JsVar array containing all subsequent arguments
-  JSWAT_BOOL, // boolean
-  JSWAT_INT32, // 32 bit int
-  JSWAT_PIN, // A pin
-  JSWAT_JSVARFLOAT, // 64 bit float
+  JSWAT_FINISH = 0, ///< no argument
+  JSWAT_VOID = 0, ///< Only for return values
+  JSWAT_JSVAR, ///< standard variable
+  JSWAT_ARGUMENT_ARRAY, ///< a JsVar array containing all subsequent arguments
+  JSWAT_BOOL, ///< boolean
+  JSWAT_INT32, ///< 32 bit int
+  JSWAT_PIN, ///< A pin
+  JSWAT_JSVARFLOAT, ///< 64 bit float
   JSWAT__LAST = JSWAT_JSVARFLOAT,
   JSWAT_MASK = NEXT_POWER_2(JSWAT__LAST)-1,
 
@@ -51,9 +52,9 @@ typedef enum {
   JSWAT_EXECUTE_IMMEDIATELY = 0x7000,
   JSWAT_EXECUTE_IMMEDIATELY_MASK = 0x7E00,
 
-  JSWAT_THIS_ARG    = 0x8000, // whether a 'this' argument should be tacked onto the start
-  JSWAT_ARGUMENTS_MASK = ~(JSWAT_MASK | JSWAT_THIS_ARG)
-} JsnArgumentType;
+  JSWAT_THIS_ARG    = 0x8000, ///< whether a 'this' argument should be tacked onto the start
+  JSWAT_ARGUMENTS_MASK = 0xFFFF ^ (JSWAT_MASK | JSWAT_THIS_ARG) ///< mask for the arguments (excluding return type)
+} PACKED_FLAGS JsnArgumentType;
 
 // number of bits needed for each argument bit
 #define JSWAT_BITS GET_BIT_NUMBER(JSWAT_MASK+1)
@@ -95,11 +96,6 @@ const JswSymList *jswGetSymbolListForObjectProto(JsVar *parent);
 /// Given the name of an Object, see if we should set it up as a builtin or not
 bool jswIsBuiltInObject(const char *name);
 
-/** If we get this in 'require', do we have the object for this
-  inside the interpreter already? If so, return the native function
-  pointer of the object's constructor */
-void *jswGetBuiltInLibrary(const char *name);
-
 /** Given a variable, return the basic object name of it */
 const char *jswGetBasicObjectName(JsVar *var);
 
@@ -117,5 +113,24 @@ void jswInit();
 
 /** Tasks to run on Deinitialisation */
 void jswKill();
+
+/** Tasks to run when a character is received on a certain event channel. True if handled and shouldn't go to IRQ */
+bool jswOnCharEvent(IOEventFlags channel, char charData);
+
+/** If we get this in 'require', do we have the object for this
+  inside the interpreter already? If so, return the native function
+  pointer of the object's constructor */
+void *jswGetBuiltInLibrary(const char *name);
+
+/** If we have a built-in JS module with the given name, return the module's contents - or 0 */
+const char *jswGetBuiltInJSLibrary(const char *name);
+
+/** Return a comma-separated list of built-in libraries */
+const char *jswGetBuiltInLibraryNames();
+
+#ifdef EMSCRIPTEN
+// on Emscripten we cant easily hack around function calls with floats/etc so we must just do this brute-force by handling every call pattern we use
+JsVar *jswCallFunctionHack(void *function, JsnArgumentType argumentSpecifier, JsVar *thisParam, JsVar **paramData, int paramCount);
+#endif
 
 #endif // JSWRAPPER_H

@@ -39,7 +39,9 @@
   #include "mbedtls/ctr_drbg.h"
   #include "jswrap_crypto.h"
 #endif
+#if defined(USE_NETWORK_JS)
 #include "network_js.h"
+#endif
 
 JsNetworkState networkState =
 #ifdef LINUX
@@ -52,6 +54,9 @@ JsNetworkState networkState =
 JsNetwork *networkCurrentStruct = 0;
 
 uint32_t networkParseIPAddress(const char *ip) {
+  if (!strcmp(ip,"localhost"))
+    return 0x0100007F; // 127.0.0.1
+
   int n = 0;
   uint32_t addr = 0;
   while (*ip) {
@@ -185,13 +190,14 @@ void networkGetHostByName(
 
 
 void networkCreate(JsNetwork *net, JsNetworkType type) {
-  net->networkVar = jsvNewStringOfLength(sizeof(JsNetworkData));
+  net->networkVar = jsvNewStringOfLength(sizeof(JsNetworkData), NULL);
   if (!net->networkVar) return;
   net->data.type = type;
   net->data.device = EV_NONE;
   net->data.pinCS = PIN_UNDEFINED;
   net->data.pinIRQ = PIN_UNDEFINED;
   net->data.pinEN = PIN_UNDEFINED;
+  net->data.recvBufferSize = 0; // use net->chunkLen
   jsvObjectSetChildAndUnLock(execInfo.hiddenRoot, NETWORK_VAR_NAME, net->networkVar);
   networkSet(net);
   networkGetFromVar(net);
@@ -224,7 +230,7 @@ bool networkGetFromVar(JsNetwork *net) {
 
   // Retrieve the data for the network var and save in the data property of the JsNetwork
   // structure.
-  jsvGetString(net->networkVar, (char *)&net->data, sizeof(JsNetworkData)+1/*trailing zero*/);
+  jsvGetStringChars(net->networkVar,0,(char *)&net->data, sizeof(JsNetworkData));
 
   // Now we know which kind of network we are working with, invoke the corresponding initialization
   // function to set the callbacks for this network tyoe.
@@ -244,11 +250,18 @@ bool networkGetFromVar(JsNetwork *net) {
 #if defined(LINUX)
   case JSNETWORKTYPE_SOCKET : netSetCallbacks_linux(net); break;
 #endif
+#if defined(USE_NETWORK_JS)
   case JSNETWORKTYPE_JS : netSetCallbacks_js(net); break;
+#endif
   default:
     jsExceptionHere(JSET_INTERNALERROR, "Unknown network device %d", net->data.type);
     networkFree(net);
     return false;
+  }
+
+  // Adjust for SO_RCVBUF
+  if (net->data.recvBufferSize > net->chunkSize) {
+    net->chunkSize = net->data.recvBufferSize;
   }
 
   // Save the current network as a global.
@@ -294,8 +307,6 @@ typedef struct {
   mbedtls_ssl_config conf;
 } SSLSocketData;
 
-BITFIELD_DECL(socketIsHTTPS, 32);
-
 static void ssl_debug( void *ctx, int level,
                       const char *file, int line, const char *str )
 {
@@ -308,7 +319,7 @@ int ssl_send(void *ctx, const unsigned char *buf, size_t len) {
   JsNetwork *net = networkGetCurrent();
   assert(net);
   int sckt = *(int *)ctx;
-  int r = net->send(net, sckt, buf, len);
+  int r = net->send(net, ST_TLS, sckt, buf, len);
   if (r==0) return MBEDTLS_ERR_SSL_WANT_WRITE;
   return r;
 }
@@ -316,7 +327,7 @@ int ssl_recv(void *ctx, unsigned char *buf, size_t len) {
   JsNetwork *net = networkGetCurrent();
   assert(net);
   int sckt = *(int *)ctx;
-  int r = net->recv(net, sckt, buf, len);
+  int r = net->recv(net, ST_TLS, sckt, buf, len);
   if (r==0) return MBEDTLS_ERR_SSL_WANT_READ;
   return r;
 }
@@ -324,7 +335,7 @@ int ssl_recv(void *ctx, unsigned char *buf, size_t len) {
 int ssl_entropy(void *data, unsigned char *output, size_t len ) {
   NOT_USED(data);
   size_t i;
-  unsigned int r;
+  unsigned int r = 0;
   for (i=0;i<len;i++) {
     if (!(i&3)) r = jshGetRandomNumber();
     output[i] = (unsigned char)r;
@@ -334,8 +345,6 @@ int ssl_entropy(void *data, unsigned char *output, size_t len ) {
 }
 
 void ssl_freeSocketData(int sckt) {
-  BITFIELD_SET(socketIsHTTPS, sckt, 0);
-
   JsVar *ssl = jsvObjectGetChild(execInfo.root, "ssl", 0);
   if (!ssl) return;
   JsVar *scktVar = jsvNewFromInteger(sckt);
@@ -509,7 +518,6 @@ bool ssl_newSocketData(int sckt, JsVar *options) {
    * Also see https://tls.mbed.org/kb/how-to/reduce-mbedtls-memory-and-storage-footprint
    * */
 
-  assert(sckt>=0 && sckt<32);
   // Create a new socketData using the variable
   JsVar *ssl = jsvObjectGetChild(execInfo.root, "ssl", JSV_OBJECT);
   if (!ssl) return false; // out of memory?
@@ -668,16 +676,13 @@ bool netCheckError(JsNetwork *net) {
   return net->checkError(net);
 }
 
-int netCreateSocket(JsNetwork *net, uint32_t host, unsigned short port, NetCreateFlags flags, JsVar *options) {
-  int sckt = net->createsocket(net, host, port);
+int netCreateSocket(JsNetwork *net, SocketType socketType, uint32_t host, unsigned short port, JsVar *options) {
+  int sckt = net->createsocket(net, socketType, host, port, options);
   if (sckt<0) return sckt;
 
 #ifdef USE_TLS
-  assert(sckt>=0 && sckt<32);
-  BITFIELD_SET(socketIsHTTPS, sckt, 0);
-  if (flags & NCF_TLS) {
+  if (socketType & ST_TLS) {
     if (ssl_newSocketData(sckt, options)) {
-      BITFIELD_SET(socketIsHTTPS, sckt, 1);
     } else {
       return -1; // fail!
     }
@@ -686,9 +691,9 @@ int netCreateSocket(JsNetwork *net, uint32_t host, unsigned short port, NetCreat
   return sckt;
 }
 
-void netCloseSocket(JsNetwork *net, int sckt) {
+void netCloseSocket(JsNetwork *net, SocketType socketType, int sckt) {
 #ifdef USE_TLS
-  if (BITFIELD_GET(socketIsHTTPS, sckt)) {
+  if (socketType & ST_TLS) {
     ssl_freeSocketData(sckt);
   }
 #endif
@@ -703,9 +708,9 @@ void netGetHostByName(JsNetwork *net, char * hostName, uint32_t* out_ip_addr) {
   net->gethostbyname(net, hostName, out_ip_addr);
 }
 
-int netRecv(JsNetwork *net, int sckt, void *buf, size_t len) {
+int netRecv(JsNetwork *net, SocketType socketType, int sckt, void *buf, size_t len) {
 #ifdef USE_TLS
-  if (BITFIELD_GET(socketIsHTTPS, sckt)) {
+  if (socketType & ST_TLS) {
     SSLSocketData *sd = ssl_getSocketData(sckt);
     if (!sd) return -1;
     if (sd->connecting) return 0; // busy
@@ -717,13 +722,13 @@ int netRecv(JsNetwork *net, int sckt, void *buf, size_t len) {
   } else
 #endif
   {
-    return net->recv(net, sckt, buf, len);
+    return net->recv(net, socketType, sckt, buf, len);
   }
 }
 
-int netSend(JsNetwork *net, int sckt, const void *buf, size_t len) {
+int netSend(JsNetwork *net, SocketType socketType, int sckt, const void *buf, size_t len) {
 #ifdef USE_TLS
-  if (BITFIELD_GET(socketIsHTTPS, sckt)) {
+  if (socketType & ST_TLS) {
     SSLSocketData *sd = ssl_getSocketData(sckt);
     if (!sd) return -1;
     if (sd->connecting) return 0; // busy
@@ -735,6 +740,6 @@ int netSend(JsNetwork *net, int sckt, const void *buf, size_t len) {
   } else
 #endif
   {
-    return net->send(net, sckt, buf, len);
+    return net->send(net, socketType, sckt, buf, len);
   }
 }

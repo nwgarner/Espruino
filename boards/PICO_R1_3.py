@@ -25,8 +25,9 @@ info = {
  'bootloader' : 1,
  'binary_name' : 'espruino_%v_pico_1r3.bin',
  'binaries' : [
-  { 'filename' : 'espruino_%v_pico_1r3_wiznet.bin', 'description' : "WIZNet W5500 Ethernet Networking"},
-  { 'filename' : 'espruino_%v_pico_1r3_cc3000.bin', 'description' : "TI CC3000 WiFi Networking"},
+  { 'filename' : 'espruino_%v_pico_1r3.bin', 'description' : "AT Command WiFi + all features"},
+  { 'filename' : 'espruino_%v_pico_1r3_wiznet.bin', 'description' : "WIZNet W5500 Ethernet  (No debugger, AT command networking or vector font)"},
+  { 'filename' : 'espruino_%v_pico_1r3_cc3000.bin', 'description' : "TI CC3000 WiFi (No debugger, AT command networking or vector font)"},
  ],
  'build' : {
    'optimizeflags' : '-Os',
@@ -35,14 +36,14 @@ info = {
      'NET',
      'GRAPHICS',
      'TV',
-     'HASHLIB',
      'FILESYSTEM',
-     'CRYPTO',
+     'CRYPTO','SHA256','SHA512',
      'TLS',
      'NEOPIXEL'
    ],
    'makefile' : [
      'DEFINES+=-DUSE_USB_OTG_FS=1  -DPICO -DPICO_1V3',
+     'DEFINES+=-DPIN_NAMES_DIRECT=1', # Package skips out some pins, so we can't assume each port starts from 0
      'STLIB=STM32F401xE',
      'PRECOMPILED_OBJS+=$(ROOT)/targetlibs/stm32f4/lib/startup_stm32f401xx.o'
    ]

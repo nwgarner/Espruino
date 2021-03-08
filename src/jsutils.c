@@ -21,7 +21,7 @@
 
 /** Error flags for things that we don't really want to report on the console,
  * but which are good to know about */
-JsErrorFlags jsErrorFlags;
+volatile JsErrorFlags jsErrorFlags;
 
 
 bool isWhitespace(char ch) {
@@ -29,7 +29,6 @@ bool isWhitespace(char ch) {
            (ch==0x0B) || // vertical tab
            (ch==0x0C) || // form feed
            (ch==0x20) || // space
-           (((unsigned char)ch)==0xA0) || // no break space
            (ch=='\n') ||
            (ch=='\r');
 }
@@ -60,27 +59,42 @@ bool isIDString(const char *s) {
 }
 
 /** escape a character - if it is required. This may return a reference to a static array,
-so you can't store the value it returns in a variable and call it again. */
-const char *escapeCharacter(char ch) {
-  if (ch=='\b') return "\\b";
-  if (ch=='\f') return "\\f";
-  if (ch=='\n') return "\\n";
-  if (ch=='\a') return "\\a";
-  if (ch=='\r') return "\\r";
-  if (ch=='\t') return "\\t";
+so you can't store the value it returns in a variable and call it again.
+If jsonStyle=true, only string escapes supported by JSON are used */
+const char *escapeCharacter(char ch, bool jsonStyle) {
+  if (ch=='\b') return "\\b"; // 8
+  if (ch=='\t') return "\\t"; // 9
+  if (ch=='\n') return "\\n"; // A
+  if (ch=='\v' && !jsonStyle) return "\\v"; // B
+  if (ch=='\f') return "\\f"; // C
+  if (ch=='\r') return "\\r"; // D
   if (ch=='\\') return "\\\\";
   if (ch=='"') return "\\\"";
-  static char buf[5];
-  if (ch<32 || ch>=127) {
+  static char buf[7];
+  unsigned char uch = (unsigned char)ch;
+  if (uch<8 && !jsonStyle) {
+    // encode less than 8 as \#
+    buf[0]='\\';
+    buf[1] = (char)('0'+uch);
+    buf[2] = 0;
+    return buf;
+  } else if (uch<32 || uch>=127) {
     /** just encode as hex - it's more understandable
      * and doesn't have the issue of "\16"+"1" != "\161" */
     buf[0]='\\';
-    buf[1]='x';
-    int n = (ch>>4)&15;
-    buf[2] = (char)((n<10)?('0'+n):('A'+n-10));
-    n=ch&15;
-    buf[3] = (char)((n<10)?('0'+n):('A'+n-10));
-    buf[4] = 0;
+    int o=2;
+    if (jsonStyle) {
+      buf[1]='u';
+      buf[o++] = '0';
+      buf[o++] = '0';
+    } else {
+      buf[1]='x';
+    }
+    int n = (uch>>4)&15;
+    buf[o++] = (char)((n<10)?('0'+n):('A'+n-10));
+    n=uch&15;
+    buf[o++] = (char)((n<10)?('0'+n):('A'+n-10));
+    buf[o++] = 0;
     return buf;
   }
   buf[1] = 0;
@@ -89,38 +103,24 @@ const char *escapeCharacter(char ch) {
 }
 
 /** Parse radix prefixes, or return 0 */
-NO_INLINE int getRadix(const char **s, int forceRadix, bool *hasError) {
+NO_INLINE int getRadix(const char **s, bool *hasError) {
   int radix = 10;
-
-  if (forceRadix > 36) {
-    if (hasError) *hasError = true;
-    return 0;
-  }
-
   if (**s == '0') {
     radix = 8;
     (*s)++;
-
     // OctalIntegerLiteral: 0o01, 0O01
     if (**s == 'o' || **s == 'O') {
       radix = 8;
-      if (forceRadix && forceRadix!=8 && forceRadix<25) return 0;
       (*s)++;
-
       // HexIntegerLiteral: 0x01, 0X01
     } else if (**s == 'x' || **s == 'X') {
       radix = 16;
-      if (forceRadix && forceRadix!=16 && forceRadix<34) return 0;
       (*s)++;
-
       // BinaryIntegerLiteral: 0b01, 0B01
     } else if (**s == 'b' || **s == 'B') {
       radix = 2;
-      if (forceRadix && forceRadix!=2 && forceRadix<12)
-        return 0;
-      else
-        (*s)++;
-    } else if (!forceRadix) {
+      (*s)++;
+    } else {
       // check for '.' or digits 8 or 9 - if so it's decimal
       const char *p;
       for (p=*s;*p;p++)
@@ -129,9 +129,6 @@ NO_INLINE int getRadix(const char **s, int forceRadix, bool *hasError) {
         else if (*p<'0' || *p>'9') break;
     }
   }
-  if (forceRadix>0 && forceRadix<=36)
-    radix = forceRadix;
-
   return radix;
 }
 
@@ -146,8 +143,20 @@ int chtod(char ch) {
   else return -1;
 }
 
-/* convert a number in the given radix to an int. if radix=0, autodetect */
-long long stringToIntWithRadix(const char *s, int forceRadix, bool *hasError) {
+/// Convert 2 characters to the hexadecimal equivalent (or -1)
+int hexToByte(char hi, char lo) {
+  int a = chtod(hi);
+  int b = chtod(lo);
+  if (a<0 || b<0) return -1;
+  return (a<<4)|b;
+}
+
+/* convert a number in the given radix to an int */
+long long stringToIntWithRadix(const char *s,
+               int forceRadix, //!< if radix=0, autodetect. if radix
+               bool *hasError, //!< If nonzero, set to whether there was an error or not
+               const char **endOfInteger //!<  If nonzero, this is set to the point at which the integer finished in the string
+               ) {
   // skip whitespace (strange parseInt behaviour)
   while (isWhitespace(*s)) s++;
 
@@ -161,8 +170,10 @@ long long stringToIntWithRadix(const char *s, int forceRadix, bool *hasError) {
   }
 
   const char *numberStart = s;
+  if (endOfInteger) (*endOfInteger)=s;
 
-  int radix = getRadix(&s, forceRadix, hasError);
+
+  int radix = forceRadix ? forceRadix : getRadix(&s, hasError);
   if (!radix) return 0;
 
   while (*s) {
@@ -175,6 +186,7 @@ long long stringToIntWithRadix(const char *s, int forceRadix, bool *hasError) {
 
   if (hasError)
     *hasError = s==numberStart; // we had an error if we didn't manage to parse any chars at all
+  if (endOfInteger) (*endOfInteger)=s;
 
   if (isNegated) return -v;
   return v;
@@ -184,7 +196,7 @@ long long stringToIntWithRadix(const char *s, int forceRadix, bool *hasError) {
  * Convert hex, binary, octal or decimal string into an int.
  */
 long long stringToInt(const char *s) {
-  return stringToIntWithRadix(s,0,0);
+  return stringToIntWithRadix(s,0,NULL,NULL);
 }
 
 #ifndef USE_FLASH_MEMORY
@@ -475,13 +487,11 @@ unsigned char *flash_memcpy(unsigned char *dst, const unsigned char *src, size_t
 #endif
 
 
-/**
- * Convert a string to a JS float variable where the string is of a specific radix.
- * \return A JS float variable.
- */
+/** Convert a string to a JS float variable where the string is of a specific radix. */
 JsVarFloat stringToFloatWithRadix(
-    const char *s, //!< The string to be converted to a float.
-	int forceRadix //!< The radix of the string data.
+    const char *s, //!< The string to be converted to a float
+  	int forceRadix, //!< The radix of the string data, or 0 to guess
+  	const char **endOfFloat //!<  If nonzero, this is set to the point at which the float finished in the string
   ) {
   // skip whitespace (strange parseFloat behaviour)
   while (isWhitespace(*s)) s++;
@@ -495,8 +505,9 @@ JsVarFloat stringToFloatWithRadix(
   }
 
   const char *numberStart = s;
+  if (endOfFloat) (*endOfFloat)=s;
 
-  int radix = getRadix(&s, forceRadix, 0);
+  int radix = forceRadix ? forceRadix : getRadix(&s, 0);
   if (!radix) return NAN;
 
 
@@ -553,22 +564,21 @@ JsVarFloat stringToFloatWithRadix(
       }
     }
   }
+
+  if (endOfFloat) (*endOfFloat)=s;
   // check that we managed to parse something at least
-  if (numberStart==s || (numberStart[0]=='.' && numberStart[1]==0)) return NAN;
+  if (numberStart==s || // nothing
+      (numberStart[0]=='.' && s==&numberStart[1]) // just a '.'
+      ) return NAN;
 
   if (isNegated) return -v;
   return v;
 }
 
 
-/**
- * convert a string to a floating point JS variable.
- * \return a JS float variable.
- */
-JsVarFloat stringToFloat(
-    const char *s //!< The string to convert to a float.
-  ) {
-  return stringToFloatWithRadix(s,0); // don't force the radix to anything in particular
+/** convert a string to a floating point JS variable. */
+JsVarFloat stringToFloat(const char *s) {
+  return stringToFloatWithRadix(s, 0, NULL); // don't force the radix to anything in particular
 }
 
 
@@ -603,17 +613,47 @@ void itostr_extra(JsVarInt vals,char *str,bool signedVal, unsigned int base) {
 }
 
 void ftoa_bounded_extra(JsVarFloat val,char *str, size_t len, int radix, int fractionalDigits) {
+  assert(len>9); // in case if strcpy
   const JsVarFloat stopAtError = 0.0000001;
-  if (isnan(val)) strncpy(str,"NaN",len);
+  if (isnan(val)) strcpy(str,"NaN");
   else if (!isfinite(val)) {
-    if (val<0) strncpy(str,"-Infinity",len);
-    else strncpy(str,"Infinity",len);
+    if (val<0) strcpy(str,"-Infinity");
+    else strcpy(str,"Infinity");
   } else {
     if (val<0) {
       if (--len <= 0) { *str=0; return; } // bounds check
       *(str++) = '-';
       val = -val;
     }
+
+#ifndef USE_NO_FLOATS
+    // check for exponents
+    int exponent = 0;
+    if (radix == 10 && val>0.0) {
+      // use repeated mul/div for ease, but to
+      // improve accuracy we multiply by 1e5 first
+      if (val >= 1E21) {
+        while (val>100000) {
+          val /= 100000;
+          exponent += 5;
+        }
+        while (val>10) {
+          val /= 10;
+          exponent ++;
+        }
+      } else if (val < 1E-6) {
+        while (val<1E-5) {
+          val *= 100000;
+          exponent -= 5;
+        }
+        while (val<1) {
+          val *= 10;
+          exponent --;
+        }
+      }
+    }
+ #endif
+
 
     // what if we're really close to an integer? Just use that...
     if (((JsVarInt)(val+stopAtError)) == (1+(JsVarInt)val))
@@ -630,17 +670,28 @@ void ftoa_bounded_extra(JsVarFloat val,char *str, size_t len, int radix, int fra
     }
 #ifndef USE_NO_FLOATS
     if (((fractionalDigits<0) && val>0) || fractionalDigits>0) {
-      if (--len <= 0) { *str=0; return; } // bounds check
-      *(str++)='.';
+      bool hasPt = false;
       val*=radix;
       while (((fractionalDigits<0) && (fractionalDigits>-12) && (val > stopAtError)) || (fractionalDigits > 0)) {
-        int v = (int)(val+((fractionalDigits==1) ? 0.4 : 0.00000001) );
+        int v = (int)(val+((fractionalDigits==1) ? 0.5 : 0.00000001) );
         val = (val-v)*radix;
+	if (v==radix) v=radix-1;
+        if (!hasPt) {	
+	  hasPt = true;
+          if (--len <= 0) { *str=0; return; } // bounds check
+          *(str++)='.';
+        }
         if (--len <= 0) { *str=0; return; } // bounds check
-        if (v==radix) v=radix-1;
         *(str++)=itoch(v);
         fractionalDigits--;
       }
+    }
+    // write exponent if enough buffer length left (> 5)
+    if (exponent && len > 5) {
+      *str++ = 'e';
+      if (exponent>0) *str++ = '+';
+      itostr(exponent, str, 10);
+      return;
     }
 #endif
 
@@ -655,6 +706,7 @@ void ftoa_bounded(JsVarFloat val,char *str, size_t len) {
 
 /// Wrap a value so it is always between 0 and size (eg. wrapAround(angle, 360))
 JsVarFloat wrapAround(JsVarFloat val, JsVarFloat size) {
+  if (size<0.0) return 0.0;
   val = val / size;
   val = val - (int)val;
   return val * size;
@@ -674,6 +726,7 @@ JsVarFloat wrapAround(JsVarFloat val, JsVarFloat size) {
  * * `%c` = char
  * * `%v` = JsVar * (doesn't have to be a string - it'll be converted)
  * * `%q` = JsVar * (in quotes, and escaped)
+ * * `%Q` = JsVar * (in quotes, and escaped the JSON subset of escape chars)
  * * `%j` = Variable printed as JSON
  * * `%t` = Type of variable
  * * `%p` = Pin
@@ -692,8 +745,24 @@ void vcbprintf(
       fmt++;
       char fmtChar = *fmt++;
       switch (fmtChar) {
-      case '0': {
-        int digits = (*fmt++) - '0';
+      case ' ':
+      case '0':
+      case '1':
+      case '2':
+      case '3':
+      case '4':
+      case '5':
+      case '6':
+      case '7':
+      case '8':
+      case '9':
+      {
+        const char *pad = " ";
+        if (fmtChar=='0') {
+          pad = "0";
+          fmtChar = *fmt++;
+        }
+        int digits = fmtChar - '0';
          // of the form '%02d'
         int v = va_arg(argp, int);
         if (*fmt=='x') itostr_extra(v, buf, false, 16);
@@ -701,7 +770,7 @@ void vcbprintf(
         fmt++; // skip over 'd'
         int len = (int)strlen(buf);
         while (len < digits) {
-          user_callback("0",user_data);
+          user_callback(pad,user_data);
           len++;
         }
         user_callback(buf,user_data);
@@ -719,23 +788,24 @@ void vcbprintf(
       case 's': user_callback(va_arg(argp, char *), user_data); break;
       case 'c': buf[0]=(char)va_arg(argp, int/*char*/);buf[1]=0; user_callback(buf, user_data); break;
       case 'q':
+      case 'Q':
       case 'v': {
-        bool quoted = fmtChar=='q';
+        bool quoted = fmtChar!='v';
+        bool isJSONStyle = fmtChar=='Q';
         if (quoted) user_callback("\"",user_data);
-        JsVar *v = jsvAsString(va_arg(argp, JsVar*), false/*no unlock*/);
+        JsVar *v = jsvAsString(va_arg(argp, JsVar*));
         buf[1] = 0;
         if (jsvIsString(v)) {
           JsvStringIterator it;
           jsvStringIteratorNew(&it, v, 0);
           // OPT: this could be faster than it is (sending whole blocks at once)
           while (jsvStringIteratorHasChar(&it)) {
-            buf[0] = jsvStringIteratorGetChar(&it);
+            buf[0] = jsvStringIteratorGetCharAndNext(&it);
             if (quoted) {
-              user_callback(escapeCharacter(buf[0]), user_data);
+              user_callback(escapeCharacter(buf[0], isJSONStyle), user_data);
             } else {
               user_callback(buf,user_data);
             }
-            jsvStringIteratorNext(&it);
           }
           jsvStringIteratorFree(&it);
           jsvUnLock(v);
@@ -743,8 +813,8 @@ void vcbprintf(
         if (quoted) user_callback("\"",user_data);
       } break;
       case 'j': {
-        JsVar *v = jsvAsString(va_arg(argp, JsVar*), false/*no unlock*/);
-        jsfGetJSONWithCallback(v, JSON_SOME_NEWLINES | JSON_PRETTY | JSON_SHOW_DEVICES, 0, user_callback, user_data);
+        JsVar *v = va_arg(argp, JsVar*);
+        jsfGetJSONWithCallback(v, NULL, JSON_SOME_NEWLINES | JSON_PRETTY | JSON_SHOW_DEVICES | JSON_ALLOW_TOJSON, 0, user_callback, user_data);
         break;
       }
       case 't': {
@@ -790,16 +860,13 @@ void espruino_snprintf_cb(const char *str, void *userdata) {
 }
 
 /// a snprintf replacement so mbedtls doesn't try and pull in the whole stdlib to cat two strings together
-int espruino_snprintf( char * s, size_t n, const char * fmt, ... ) {
+int espruino_snprintf_va( char * s, size_t n, const char * fmt, va_list argp ) {
   espruino_snprintf_data d;
   d.outPtr = s;
   d.idx = 0;
   d.len = n;
 
-  va_list argp;
-  va_start(argp, fmt);
   vcbprintf(espruino_snprintf_cb,&d, fmt, argp);
-  va_end(argp);
 
   if (d.idx < d.len) d.outPtr[d.idx] = 0;
   else d.outPtr[d.len-1] = 0;
@@ -807,17 +874,54 @@ int espruino_snprintf( char * s, size_t n, const char * fmt, ... ) {
   return (int)d.idx;
 }
 
+/// a snprintf replacement so mbedtls doesn't try and pull in the whole stdlib to cat two strings together
+int espruino_snprintf( char * s, size_t n, const char * fmt, ... ) {
+  va_list argp;
+  va_start(argp, fmt);
+  int l = espruino_snprintf_va(s,n,fmt,argp);
+  va_end(argp);
+  return l;
+}
+
+
+
 #ifdef ARM
-extern int LINKER_END_VAR; // should be 'void', but 'int' avoids warnings
+extern uint32_t LINKER_END_VAR; // should be 'void', but 'int' avoids warnings
 #endif
 
 /** get the amount of free stack we have, in bytes */
 size_t jsuGetFreeStack() {
 #ifdef ARM
   void *frame = __builtin_frame_address(0);
-  return (size_t)((char*)&LINKER_END_VAR) - (size_t)((char*)frame);
+  size_t stackPos = (size_t)((char*)frame);
+  size_t stackEnd = (size_t)((char*)&LINKER_END_VAR);
+  if (stackPos < stackEnd) return 0; // should never happen, but just in case of overflow!
+  return  stackPos - stackEnd;
+#elif defined(LINUX)
+  // On linux, we set STACK_BASE from `main`.
+  char ptr; // this is on the stack
+  extern void *STACK_BASE;
+  uint32_t count =  (uint32_t)((size_t)STACK_BASE - (size_t)&ptr);
+  const uint32_t max_stack = 1000000; // give it 1 megabyte of stack
+  if (count>max_stack) return 0;
+  return max_stack - count;
+#elif defined(ESP32)
+  char ptr; // this is on the stack
+
+  //RTOS task stacks work the opposite way to what you may expect.
+  //Early entries are in higher memory locations.
+  //Later entries are in lower memory locations.
+
+  
+  uint32_t stackPos   = (uint32_t)&ptr;
+  uint32_t stackStart = (uint32_t)espruino_stackHighPtr - ESP_STACK_SIZE;
+
+  if (stackPos < stackStart) return 0; // should never happen, but just in case of overflow!
+  
+  return stackPos - stackStart;
 #else
-  return 100000000; // lots.
+  // stack depth seems pretty platform-specific :( Default to a value that disables it
+  return 1000000; // no stack depth check on this platform
 #endif
 }
 

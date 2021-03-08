@@ -14,7 +14,7 @@
  * ----------------------------------------------------------------------------
  */
 
-#ifdef NRF52
+#ifdef NRF52_SERIES
 #include "i2s_ws2812b_drive.h"
 #endif
 #ifdef ESP8266
@@ -23,6 +23,9 @@
 #endif
 #ifdef ESP32
 #include "esp32_neopixel.h"
+#endif
+#ifdef WIO_LTE
+#include "stm32_ws2812b_driver.h"
 #endif
 
 #include <jswrap_neopixel.h>
@@ -39,7 +42,7 @@ bool neopixelWrite(Pin pin, unsigned char *rgbData, size_t rgbSize);
   "type" : "library",
   "class" : "neopixel"
 }
-This library allows you to write to Neopixel/WS281x/APA10x LED strips
+This library allows you to write to Neopixel/WS281x/APA10x/SK6812 LED strips
 
 These use a high speed single-wire protocol which needs platform-specific
 implementation on some devices - hence this library to simplify things.
@@ -52,7 +55,7 @@ implementation on some devices - hence this library to simplify things.
   "generate" : "jswrap_neopixel_write",
   "params" : [
     ["pin", "pin", "The Pin the LEDs are connected to"],
-    ["data","JsVar","The data to write to the LED strip"]
+    ["data","JsVar","The data to write to the LED strip (must be a multiple of 3 bytes long)"]
   ]
 }
 Write to a strip of NeoPixel/WS281x/APA104/APA106/SK6812-style LEDs
@@ -61,11 +64,12 @@ attached to the given pin.
 ```
 // set just one pixel, red, green, blue
 require("neopixel").write(B15, [255,0,0]);
+```
 
+```
 // Produce an animated rainbow over 25 LEDs
 var rgb = new Uint8ClampedArray(25*3);
 var pos = 0;
-
 function getPattern() {
   pos++;
   for (var i=0;i<rgb.length;) {
@@ -75,7 +79,6 @@ function getPattern() {
   }
   return rgb;
 }
-
 setInterval(function() {
   require("neopixel").write(B15, getPattern());
 }, 100);
@@ -85,6 +88,10 @@ setInterval(function() {
 
 * Different types of LED have the data in different orders - so don't
 be surprised by RGB or BGR orderings!
+
+* Some LED strips (SK6812) actually take 4 bytes per LED (red, green, blue and white).
+These are still supported but the array of data supplied must still be a multiple of 3
+bytes long. Just round the size up - it won't cause any problems.
 
 * On some platforms like STM32, pins capable of hardware SPI MOSI
 are required.
@@ -122,7 +129,13 @@ void jswrap_neopixel_write(Pin pin, JsVar *data) {
 // -------------------------------------------------------------- Platform specific
 // -----------------------------------------------------------------------------------
 
-#if defined(STM32) // ----------------------------------------------------------------
+#if defined(WIO_LTE)
+
+bool neopixelWrite(Pin pin, unsigned char *rgbData, size_t rgbSize) {
+  return stm32_neopixelWrite(pin, rgbData, rgbSize);
+}
+
+#elif defined(STM32) // ----------------------------------------------------------------
 
 // this one could potentially work on other platforms as well...
 bool neopixelWrite(Pin pin, unsigned char *rgbData, size_t rgbSize) {
@@ -161,10 +174,10 @@ bool neopixelWrite(Pin pin, unsigned char *rgbData, size_t rgbSize) {
 }
 
 
-#elif defined(NRF52) // ----------------------------------------------------------------
+#elif defined(NRF52_SERIES) // ----------------------------------------------------------------
 
 bool neopixelWrite(Pin pin, unsigned char *rgbData, size_t rgbSize) {
-#ifdef NRF52
+#ifdef NRF52_SERIES
   if (!jshIsPinValid(pin)) {
     jsExceptionHere(JSET_ERROR, "Pin is not valid.");
     return false;
